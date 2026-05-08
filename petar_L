@@ -1,0 +1,592 @@
+setwd("C:/Users/anapo/Desktop/docdir/cbo/petar")
+library("qiime2R")
+library("phyloseq")
+library("ggplot2")
+library("ggpubr")
+library("vegan")
+library("reshape2")
+library("tidyverse")
+library("magrittr")
+library(geomtextpath)
+library(dplyr)
+library("UpSetR")
+library(metagenomeSeq)
+library(ggvenn)
+library(ggVennDiagram)
+library(ggnested)
+library(scales)
+library(ape)
+library(RColorBrewer)
+library(ggtree)
+library(tibble)
+library(ggrepel)
+# ============================================================
+# LOAD AND CLEAN DATA
+# ============================================================
+
+PETAR <- qza_to_phyloseq(
+  features = "C:/Users/anapo/Desktop/docdir/cbo/petar/table.qza",
+  taxonomy = "C:/Users/anapo/Desktop/docdir/cbo/petar/taxonomy_normal.qza",
+  metadata = "C:/Users/anapo/Desktop/docdir/cbo/petar/sample-metadata1.tsv"
+)
+# Remove unwanted taxa
+PETAR <- subset_taxa(PETAR, !is.na(Kingdom) & !Kingdom %in% c("d__Eukaryota", "Unassigned"))
+PETAR <- subset_taxa(PETAR, !Order  %in% c("o__Chloroplast"))
+PETAR <- subset_taxa(PETAR, !Family %in% c("f__Mitochondria"))
+
+# Strip taxonomy prefixes
+tax_table(PETAR)[,1] <- gsub("d__", "", tax_table(PETAR)[,1])
+tax_table(PETAR)[,2] <- gsub("p__", "", tax_table(PETAR)[,2])
+tax_table(PETAR)[,3] <- gsub("c__", "", tax_table(PETAR)[,3])
+tax_table(PETAR)[,4] <- gsub("o__", "", tax_table(PETAR)[,4])
+tax_table(PETAR)[,5] <- gsub("f__", "", tax_table(PETAR)[,5])
+tax_table(PETAR)[,6] <- gsub("g__", "", tax_table(PETAR)[,6])
+tax_table(PETAR)[,7] <- gsub("s__", "", tax_table(PETAR)[,7])
+PETAR <- subset_taxa(PETAR, !Family %in% c("Mitochondria", "Chloroplast"))
+
+# Fix Core.depth factor levels: lowest to highest
+ps_df      <- data.frame(sample_data(PETAR))
+ps_df      <- ps_df %>% mutate(depth_num = as.numeric(sub("-.*", "", Core.depth))) %>% arrange(depth_num)
+depth_levels <- unique(ps_df$Core.depth)
+sample_data(PETAR)$Core.depth <- factor(sample_data(PETAR)$Core.depth, levels = depth_levels)
+
+cat("PETAR loaded and cleaned\n")
+cat(paste0("  Samples: ", nsamples(PETAR), " | ASVs: ", ntaxa(PETAR), "\n"))
+
+# Check current sample names
+sample_names(PETAR)
+
+# Create a new column separating LB from L
+sample_data(PETAR)$Cave <- ifelse(
+  grepl("^LB", sample_names(PETAR)), "LB",
+  "L"
+)
+
+# Verify
+table(sample_data(PETAR)$Cave)
+
+sample_data(PETAR)$Cave <- ifelse(
+  grepl("^LB", sample_names(PETAR)), "LB",
+  "L"
+)
+# Separate datasets
+PETAR_L  <- subset_samples(PETAR, Cave == "L")
+PETAR_LB <- subset_samples(PETAR, Cave == "LB")
+
+# Remove taxa with zero abundance after subsetting
+PETAR_L  <- prune_taxa(taxa_sums(PETAR_L) > 0, PETAR_L)
+PETAR_LB <- prune_taxa(taxa_sums(PETAR_LB) > 0, PETAR_LB)
+
+# Check
+PETAR_L
+PETAR_LB
+
+#WORKING WWITH LABORATÓRIO###
+cat("\n[1] Basic Information\n")
+sample_names(PETAR_L)
+rank_names(PETAR_L)
+sample_variables(PETAR_L)
+ntaxa(PETAR_L)
+
+asv_df <- otu_table(PETAR_L)
+cat(paste0("Mean ASVs/sample: ", round(mean(colSums(asv_df != 0)), 1), "\n"))
+cat(paste0("SD ASVs/sample:   ", round(sd(  colSums(asv_df != 0)), 1), "\n"))
+cat(paste0("Total reads:      ", sum(sample_sums(PETAR_L)), "\n"))
+cat(paste0("Mean reads:       ", round(mean(sample_sums(PETAR_L)), 1), "\n"))
+cat(paste0("SD reads:         ", round(sd(  sample_sums(PETAR_L)), 1), "\n"))
+
+sums <- data.frame(sample_sums(PETAR_L))
+write.table(sums, file = "PETAR_number_reads.tsv", quote = FALSE, sep = "\t")
+
+cat("\n[2] Library size plot\n")
+
+df_lib             <- data.frame(sample_data(PETAR_L))
+df_lib$LibrarySize <- sample_sums(PETAR_L)
+df_lib             <- df_lib[order(df_lib$LibrarySize), ]
+df_lib$Index       <- seq(nrow(df_lib))
+
+p_lib <- ggplot(data = df_lib, aes(x = Index, y = LibrarySize)) +
+  geom_bar(stat = "identity", fill = "#E07B39") +
+  geom_text(aes(label = Core.depth), size = 3.5, vjust = -0.5) +
+  labs(title = "Library Size — PETAR LABORATÓRIO (Caves)",
+       x = "Sample (ordered by size)", y = "Number of Reads") +
+  theme_classic() +
+  theme(
+    text         = element_text(size = 13),
+    plot.title   = element_text(hjust = 0.5, face = "bold", size = 15),
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+print(p_lib)
+ggsave("PETAR_L_librarysize.png", plot = p_lib, width = 12, height = 6,
+       dpi = 600, bg = "white")
+
+# ============================================================
+# 3. ALPHA DIVERSITY — no rarefaction
+# ============================================================
+
+cat("\n[3] Alpha diversity\n")
+
+rich <- estimate_richness(PETAR_L, measures = c("Shannon", "Simpson", "InvSimpson"))
+rich$Core.depth <- sample_data(PETAR_L)$Core.depth
+write.table(rich, file = "PETAR_alpha_div.tsv", quote = FALSE, sep = "\t")
+
+# Mean and SD
+cat("InvSimpson mean per depth:\n")
+print(aggregate(InvSimpson ~ Core.depth, data = rich, mean))
+cat("InvSimpson SD per depth:\n")
+print(aggregate(InvSimpson ~ Core.depth, data = rich, sd))
+
+# Plot
+rich_long <- rich %>%
+  rownames_to_column("Sample") %>%
+  pivot_longer(cols = c("Shannon", "Simpson", "InvSimpson"),
+               names_to = "Metric", values_to = "Value")
+rich_long$Core.depth <- factor(rich_long$Core.depth, levels = depth_levels)
+
+n_depths      <- length(depth_levels)
+depth_colors  <- colorRampPalette(c("grey85", "#E07B39"))(n_depths)
+depth_col_vec <- setNames(depth_colors, depth_levels)
+
+p_alpha <- ggplot(rich_long, aes(x = Core.depth, y = Value, color = Core.depth)) +
+  
+  geom_point(size = 4, alpha = 0.9) +
+  
+  geom_text_repel(aes(label = Sample),
+                  size = 3,
+                  color = "black",
+                  show.legend = FALSE) +
+  
+  geom_line(aes(group = 1),
+            color = "grey60",
+            linewidth = 0.5,
+            linetype = "dashed") +
+  
+  facet_wrap(~ Metric, scales = "free_y", ncol = 3) +
+  
+  scale_color_manual(values = depth_col_vec) +
+  
+  labs(title = "Alpha Diversity — PETAR LABORATÓRIO (Caves)",
+       x = "Core Depth (cm)",
+       y = "Index Value") +
+  
+  theme_classic()
+
+print(p_alpha)
+ggsave("PETAR_L_alpha_diversity.png", plot = p_alpha, width = 14, height = 5,
+       dpi = 600, bg = "white")
+# ============================================================
+# 4. TAXONOMY BARPLOT — ggnested (Phylum + Class)
+# ============================================================
+
+cat("\n[4] Taxonomy barplot\n")
+
+ps_class <- tax_glom(PETAR_L, taxrank = "Class", NArm = FALSE)
+ps_rel   <- transform_sample_counts(ps_class, function(x) x / sum(x))
+tax_melt <- psmelt(ps_rel)
+
+tax_melt <- tax_melt %>%
+  mutate(depth_num = as.numeric(sub("-.*", "", Core.depth)))
+tax_melt$Core.depth <- factor(tax_melt$Core.depth, levels = depth_levels)
+
+# Top 50 Classes
+top_classes <- tax_melt %>%
+  group_by(Class) %>%
+  summarise(mean_abund = mean(Abundance), .groups = "drop") %>%
+  arrange(desc(mean_abund)) %>%
+  slice_head(n = 50) %>%
+  pull(Class)
+
+tax_melt <- tax_melt %>%
+  mutate(
+    Class_plot  = ifelse(Class  %in% top_classes, Class,  "Other"),
+    Phylum_plot = ifelse(Class  %in% top_classes, Phylum, "Other")
+  )
+
+phyla_list <- tax_melt %>%
+  filter(Phylum_plot != "Other") %>%
+  pull(Phylum_plot) %>% unique() %>% sort()
+class_list <- tax_melt %>%
+  filter(Class_plot  != "Other") %>%
+  pull(Class_plot)  %>% unique() %>% sort()
+
+tax_melt$Phylum_plot <- factor(tax_melt$Phylum_plot, levels = c(phyla_list, "Other"))
+tax_melt$Class_plot  <- factor(tax_melt$Class_plot,  levels = c(class_list, "Other"))
+
+n_phyla       <- length(phyla_list)
+phylum_colors <- setNames(
+  colorRampPalette(brewer.pal(12, "Paired"))(n_phyla + 1),
+  c(phyla_list, "Other")
+)
+phylum_colors["Other"] <- "#D3D3D3"
+
+barplot_nested <- ggnested(
+  data    = tax_melt,
+  mapping = aes(x          = Abundance,
+                y          = Core.depth,
+                main_group = Phylum_plot,
+                sub_group  = Class_plot),
+  main_keys = TRUE
+) +
+  geom_col(position = "stack", width = 0.85) +
+  scale_x_continuous(labels = percent_format(accuracy = 1),
+                     expand = c(0, 0), limits = c(0, 1.01)) +
+  labs(x     = "Relative Abundance (%)",
+       y     = "Core Depth (cm)",
+       fill  = "Phylum / Class",
+       title = "Taxonomic Composition — PETAR LABORATÓRIO (Caves)") +
+  theme_classic() +
+  theme(
+    text             = element_text(family = "Liberation Serif", size = 13),
+    plot.title       = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.text.y      = element_text(size = 11, color = "black"),
+    axis.text.x      = element_text(size = 11, color = "black"),
+    axis.title.x     = element_text(size = 13, face = "bold", margin = margin(t = 8)),
+    axis.title.y     = element_text(size = 13, face = "bold", margin = margin(r = 8)),
+    axis.line        = element_line(color = "black", linewidth = 0.7),
+    axis.ticks       = element_line(color = "black"),
+    strip.text       = element_text(size = 13, face = "bold"),
+    strip.background = element_rect(fill = "grey92", color = "black", linewidth = 0.7),
+    legend.position  = "right",
+    legend.title     = element_text(size = 12, face = "bold"),
+    legend.text      = element_text(size = 9),
+    legend.key.size  = unit(0.45, "cm"),
+    panel.spacing    = unit(1, "lines"),
+    plot.margin      = margin(12, 12, 12, 12)
+  )
+
+print(barplot_nested)
+ggsave("PETAR_L_taxonomy_barplot.png", plot = barplot_nested,
+       width = 18, height = 12, dpi = 600, bg = "white")
+# ============================================================
+# 5. PCoA — Weighted UniFrac (using PETAR tree)
+# ============================================================
+
+cat("\n[5] Weighted UniFrac PCoA\n")
+
+# Load tree
+tree_petar_L <- qza_to_phyloseq(
+  features = "C:/Users/anapo/Desktop/docdir/cbo/petar/table.qza",
+  tree     = "C:/Users/anapo/Desktop/docdir/cbo/petar/rooted-tree.qza"
+) %>% phy_tree()
+
+# Prune to shared ASVs
+shared_asvs    <- intersect(taxa_names(PETAR_L), tree_petar_L$tip.label)
+cat(paste0("  Shared ASVs (PETAR_L + tree): ", length(shared_asvs), "\n"))
+
+PETAR_L_tree         <- prune_taxa(shared_asvs, PETAR_L)
+tree_petar_L_pruned  <- keep.tip(tree_petar_L, shared_asvs)
+PETAR_L_wt           <- merge_phyloseq(PETAR_L_tree, tree_petar_L_pruned)
+
+# Calculate Weighted UniFrac
+wunifrac_dist <- UniFrac(PETAR_L_wt, weighted = TRUE, normalized = TRUE, parallel = FALSE)
+
+# PCoA
+pcoa_res  <- cmdscale(wunifrac_dist, k = 2, eig = TRUE)
+eig       <- pcoa_res$eig
+var_exp   <- round(eig / sum(eig[eig > 0]) * 100, 2)
+pc1_label <- paste0("PC1 (", var_exp[1], "%)")
+pc2_label <- paste0("PC2 (", var_exp[2], "%)")
+
+pcoa_df <- data.frame(
+  PC1      = pcoa_res$points[, 1],
+  PC2      = pcoa_res$points[, 2],
+  SampleID = rownames(pcoa_res$points)
+)
+
+meta_df          <- data.frame(sample_data(PETAR_L_wt))
+meta_df$SampleID <- rownames(meta_df)
+
+pcoa_df <- left_join(pcoa_df,
+                     meta_df[, c("SampleID", "Core.depth")],
+                     by = "SampleID")
+pcoa_df$Core.depth <- factor(pcoa_df$Core.depth, levels = depth_levels)
+
+# PERMANOVA
+meta_ordered <- meta_df[match(rownames(as.matrix(wunifrac_dist)), meta_df$SampleID), ]
+perm_result  <- adonis2(wunifrac_dist ~ Core.depth, data = meta_ordered, permutations = 999)
+cat("\nPERMANOVA result:\n"); print(perm_result)
+
+r2_val  <- round(perm_result$R2[1], 3)
+p_val   <- perm_result$`Pr(>F)`[1]
+p_label <- ifelse(p_val < 0.001, "p < 0.001",
+                  ifelse(p_val < 0.01,  "p < 0.01",
+                         ifelse(p_val < 0.05,  "p < 0.05",
+                                paste0("p = ", round(p_val, 3)))))
+permanova_label <- paste0("PERMANOVA\nR² = ", r2_val, ", ", p_label)
+
+# Plot
+pcoa_plot <- ggplot(pcoa_df,
+                    aes(x = PC1, y = PC2, color = Core.depth, label = SampleID)) +
+  geom_point(size = 4.5, alpha = 0.95) +
+  geom_text(vjust = -0.9, size = 3, color = "black", show.legend = FALSE, fontface = "italic") +
+  annotate("text", x = Inf, y = -Inf, label = permanova_label,
+           hjust = 1.05, vjust = -0.5, size = 4, fontface = "italic") +
+  scale_color_manual(values = depth_col_vec, name = "Core Depth (cm)") +
+  labs(title = "PCoA — Weighted UniFrac — PETAR LABORATÓRIO (Caves)",
+       x = pc1_label, y = pc2_label) +
+  theme_classic() +
+  theme(
+    text            = element_text(family = "Liberation Serif", size = 13),
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.position = "right",
+    legend.title    = element_text(size = 12, face = "bold"),
+    legend.text     = element_text(size = 10),
+    axis.text       = element_text(size = 11, color = "black"),
+    axis.title      = element_text(size = 13, face = "bold"),
+    axis.line       = element_line(color = "black", linewidth = 0.7),
+    plot.margin     = margin(12, 12, 12, 12)
+  )
+
+print(pcoa_plot)
+ggsave("PETAR__L_pcoa_wunifrac.png", plot = pcoa_plot,
+       width = 10, height = 8, dpi = 600, bg = "white")
+# ============================================================
+# 6. CIRCULAR PHYLOGENETIC TREE
+# ============================================================
+
+cat("\n[6] Phylogenetic tree\n")
+
+otu_df <- as.data.frame(otu_table(PETAR_L))
+if (taxa_are_rows(PETAR_L)) otu_df <- t(otu_df)
+otu_df <- as.data.frame(otu_df)
+
+# Assign each ASV to its dominant depth
+asv_depth <- apply(otu_df, 2, function(x) {
+  if (all(x == 0)) return(NA)
+  rownames(otu_df)[which.max(x)]
+})
+
+tip_data <- data.frame(
+  label    = tree_petar_L_pruned$tip.label,
+  SampleID = asv_depth[tree_petar_L_pruned$tip.label]
+) %>%
+  left_join(meta_df[, c("SampleID", "Core.depth")], by = "SampleID") %>%
+  mutate(Core.depth = factor(Core.depth, levels = depth_levels))
+
+# Explicit blue -> red palette for tree (maximum contrast per depth)
+tree_colors  <- colorRampPalette(c("#053061", "#2166AC", "#4393C3", "#92C5DE",
+                                   
+                                   "#F4A582", "#D6604D", "#B2182B", "#67001F"))(n_depths)
+tree_col_vec <- setNames(tree_colors, depth_levels)
+
+tree_plot <- ggtree(tree_petar_L_pruned, layout = "circular",
+                    size = 0.12, color = "grey50") %<+% tip_data +
+  geom_tippoint(aes(color = Core.depth), size = 0.7, alpha = 0.85) +
+  scale_color_manual(
+    values   = tree_col_vec,
+    name     = "Core Depth (cm)",
+    na.value = "grey80",
+    guide    = guide_legend(override.aes = list(size = 3.5))
+  ) +
+  labs(title = "Phylogenetic Tree — PETAR OLABORATÓRIO (Caves)") +
+  theme(
+    plot.title      = element_text(hjust = 0.5, face = "bold", size = 15),
+    legend.position = "right",
+    legend.title    = element_text(size = 11, face = "bold"),
+    legend.text     = element_text(size = 9),
+    plot.margin     = margin(15, 15, 15, 15)
+  )
+
+print(tree_plot)
+ggsave("PETAR_phylogenetic_L_tree.png", plot = tree_plot,
+       width = 20, height = 20, dpi = 600, bg = "white")
+
+# ============================================================
+# 7. Faith's Phylogenetic Diversity — PETAR_L
+# ============================================================
+
+cat("\n[7] Faith's Phylogenetic Diversity\n")
+
+library(picante)
+library(dplyr)
+library(ggplot2)
+
+# ------------------------------------------------------------
+# Depth colors
+# ------------------------------------------------------------
+
+depth_levels <- levels(sample_data(PETAR_L)$Core.depth)
+
+n_depths <- length(depth_levels)
+
+tree_colors <- colorRampPalette(c(
+  "#053061", "#2166AC", "#4393C3", "#92C5DE",
+  "#F4A582", "#D6604D", "#B2182B", "#67001F"
+))(n_depths)
+
+tree_col_vec <- setNames(tree_colors, depth_levels)
+
+# ------------------------------------------------------------
+# Community matrix
+# ------------------------------------------------------------
+
+if (taxa_are_rows(PETAR_L_wt)) {
+  comm_matrix <- as.data.frame(t(otu_table(PETAR_L_wt)))
+} else {
+  comm_matrix <- as.data.frame(otu_table(PETAR_L_wt))
+}
+
+# ------------------------------------------------------------
+# Faith's PD
+# ------------------------------------------------------------
+
+pd_result <- pd(comm_matrix,
+                tree_petar_pruned,
+                include.root = TRUE)
+
+pd_result$SampleID <- rownames(pd_result)
+
+# ------------------------------------------------------------
+# Metadata join
+# ------------------------------------------------------------
+
+meta_petar <- data.frame(sample_data(PETAR_L))
+meta_petar$SampleID <- rownames(meta_petar)
+
+# Core depth
+pd_result$Core.depth <- meta_petar$Core.depth[
+  match(pd_result$SampleID, meta_petar$SampleID)
+]
+
+# Ponto amostral
+pd_result$Ponto.amostral <- meta_petar$Ponto.amostral[
+  match(pd_result$SampleID, meta_petar$SampleID)
+]
+
+# Factor order
+pd_result$Core.depth <- factor(
+  pd_result$Core.depth,
+  levels = depth_levels
+)
+
+# Order
+pd_result <- pd_result[
+  order(pd_result$Ponto.amostral,
+        pd_result$Core.depth),
+]
+
+# ------------------------------------------------------------
+# Save results
+# ------------------------------------------------------------
+
+write.table(
+  pd_result,
+  file = "PETAR_L_faiths_pd.tsv",
+  quote = FALSE,
+  sep = "\t"
+)
+
+# ------------------------------------------------------------
+# Summary statistics
+# ------------------------------------------------------------
+
+pd_summary <- pd_result %>%
+  group_by(Ponto.amostral, Core.depth) %>%
+  summarise(
+    mean_PD = mean(PD, na.rm = TRUE),
+    sd_PD   = sd(PD, na.rm = TRUE),
+    n       = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    sd_PD = ifelse(is.na(sd_PD), 0, sd_PD)
+  )
+
+# ------------------------------------------------------------
+# Plot
+# ------------------------------------------------------------
+
+p_pd <- ggplot(
+  pd_summary,
+  aes(x = Core.depth,
+      y = mean_PD,
+      group = Ponto.amostral,
+      color = Core.depth)
+) +
+  
+  # Individual samples
+  geom_point(
+    data = pd_result,
+    aes(x = Core.depth,
+        y = PD,
+        color = Core.depth),
+    size = 3,
+    alpha = 0.7,
+    position = position_jitter(width = 0.05)
+  ) +
+  
+  # Sample labels
+  geom_text(
+    data = pd_result,
+    aes(x = Core.depth,
+        y = PD,
+        label = SampleID),
+    color = "black",
+    size = 3,
+    vjust = -0.7,
+    position = position_jitter(width = 0.05)
+  ) +
+  
+  geom_line(
+    aes(group = 1),
+    color = "grey40",
+    linewidth = 0.7,
+    linetype = "dashed"
+  ) +
+ 
+  # Separate panels
+  facet_wrap(~ Ponto.amostral) +
+  
+  scale_color_manual(values = tree_col_vec) +
+  
+  labs(
+    title = "Faith's Phylogenetic Diversity — PETAR LABORATÓRIO",
+    subtitle = "Separated by Ponto Amostral",
+    x = "Core Depth (cm)",
+    y = "Faith's PD (total branch length)"
+  ) +
+  
+  theme_classic() +
+  
+  theme(
+    text = element_text(size = 13),
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 15
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5,
+      size = 11
+    ),
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1
+    ),
+    strip.text = element_text(
+      face = "bold",
+      size = 12
+    ),
+    legend.position = "none"
+  )
+
+# ------------------------------------------------------------
+# Show plot
+# ------------------------------------------------------------
+
+print(p_pd)
+
+# ------------------------------------------------------------
+# Save figure
+# ------------------------------------------------------------
+
+ggsave(
+  "PETAR_L_faith_pd_by_point.png",
+  plot = p_pd,
+  width = 12,
+  height = 6,
+  dpi = 600,
+  bg = "white"
+)
