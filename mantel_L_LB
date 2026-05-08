@@ -1,0 +1,390 @@
+
+# ============================================================
+# linkET Mantel Test — PETAR (Caves)
+# Separated by Cave: L vs LB
+# Spec groups: Top 10 most abundant Phyla
+# Environmental variables: all metadata variables
+# ============================================================
+
+library(tidyverse)
+library(linkET)
+library(phyloseq)
+library(qiime2R)
+library(RColorBrewer)
+library(vegan)
+
+setwd("C:/Users/anapo/Desktop/docdir/cbo")
+
+# ============================================================
+# STEP 1: Load PETAR phyloseq if not already in environment
+# ============================================================
+
+if (!exists("PETAR")) {
+  PETAR <- qza_to_phyloseq(
+    features = "C:/Users/anapo/Desktop/docdir/cbo/petar/table.qza",
+    taxonomy = "C:/Users/anapo/Desktop/docdir/cbo/petar/taxonomy_normal.qza",
+    metadata = "C:/Users/anapo/Desktop/docdir/cbo/petar/sample-metadata.tsv"
+  )
+  # Clean taxonomy prefixes
+  tax_table(PETAR)[,1] <- gsub("d__", "", tax_table(PETAR)[,1])
+  tax_table(PETAR)[,2] <- gsub("p__", "", tax_table(PETAR)[,2])
+  tax_table(PETAR)[,3] <- gsub("c__", "", tax_table(PETAR)[,3])
+  tax_table(PETAR)[,4] <- gsub("o__", "", tax_table(PETAR)[,4])
+  tax_table(PETAR)[,5] <- gsub("f__", "", tax_table(PETAR)[,5])
+  tax_table(PETAR)[,6] <- gsub("g__", "", tax_table(PETAR)[,6])
+  tax_table(PETAR)[,7] <- gsub("s__", "", tax_table(PETAR)[,7])
+  PETAR <- subset_taxa(PETAR, !is.na(Kingdom) &
+                         !Kingdom %in% c("Eukaryota", "Unassigned"))
+  PETAR <- subset_taxa(PETAR, !Order  %in% c("Chloroplast"))
+  PETAR <- subset_taxa(PETAR, !Family %in% c("Mitochondria"))
+}
+
+# ============================================================
+# STEP 2: Add Cave column (L vs LB)
+# ============================================================
+
+sample_data(PETAR)$Cave <- ifelse(
+  grepl("^LB", sample_names(PETAR)), "LB", "L"
+)
+
+cat("Sample distribution:\n")
+print(table(sample_data(PETAR)$Cave))
+
+# ============================================================
+# STEP 3: Split into L and LB
+# ============================================================
+
+ps_L  <- subset_samples(PETAR, Cave == "L")
+ps_L  <- prune_taxa(taxa_sums(ps_L)  > 0, ps_L)
+
+ps_LB <- subset_samples(PETAR, Cave == "LB")
+ps_LB <- prune_taxa(taxa_sums(ps_LB) > 0, ps_LB)
+
+cat(paste0("\nL samples:  ", nsamples(ps_L),  " | ASVs: ", ntaxa(ps_L),  "\n"))
+cat(paste0("LB samples: ", nsamples(ps_LB), " | ASVs: ", ntaxa(ps_LB), "\n"))
+
+# ============================================================
+# STEP 4: Find top 10 most abundant Phyla per group (L or LB)
+# Done inside run_mantel_plot() per dataset
+# ============================================================
+
+get_top10_phyla <- function(ps, label) {
+  ps_phylum    <- tax_glom(ps, taxrank = "Phylum", NArm = TRUE)
+  phylum_sums  <- taxa_sums(ps_phylum)
+  phylum_names <- as.character(tax_table(ps_phylum)[, "Phylum"])
+  names(phylum_names) <- names(phylum_sums)
+  top10_ids    <- names(sort(phylum_sums, decreasing = TRUE))[1:min(10, length(phylum_sums))]
+  top10_names  <- phylum_names[top10_ids]
+  cat(paste0("\nTop 10 Phyla for ", label, ":\n"))
+  for (i in seq_along(top10_names)) {
+    cat(paste0("  Spec", sprintf("%02d", i), ": ", top10_names[i], "\n"))
+  }
+  return(top10_names)
+}
+
+# ============================================================
+# STEP 5: Build OTU matrix function (samples x ASVs)
+# ============================================================
+
+build_otu_matrix <- function(ps) {
+  otu_mat <- as.data.frame(t(otu_table(ps)))  # samples x ASVs
+  # Relative abundance
+  otu_rel <- otu_mat / rowSums(otu_mat)
+  return(otu_rel)
+}
+
+# ============================================================
+# STEP 6: Build spec_select indices per Phylum
+# ============================================================
+
+build_spec_select <- function(ps, top10_phyla_names) {
+  otu_rel  <- build_otu_matrix(ps)
+  tax_df   <- as.data.frame(tax_table(ps))
+  
+  spec_select <- list()
+  for (i in seq_along(top10_phyla_names)) {
+    asv_ids <- rownames(tax_df)[tax_df$Phylum == top10_phyla_names[i]]
+    asv_ids <- intersect(asv_ids, colnames(otu_rel))
+    if (length(asv_ids) > 0) {
+      idx <- which(colnames(otu_rel) %in% asv_ids)
+      spec_select[[paste0("Spec", sprintf("%02d", i))]] <- idx
+    }
+  }
+  return(list(otu_rel = otu_rel, spec_select = spec_select))
+}
+
+# ============================================================
+# STEP 7: Build environmental matrix function
+# ============================================================
+
+build_env_matrix <- function(ps) {
+  meta <- data.frame(sample_data(ps))
+  
+  # Select geochemical environmental variables only
+  env_vars <- c("MgO", "Al2O3", "SiO2", "P", "S", "Cl",
+                "K2O", "Ca", "Ti", "V", "Cr", "Mn", "Fe")
+  
+  # Keep only columns that exist in metadata
+  env_vars <- env_vars[env_vars %in% colnames(meta)]
+  
+  env_mat <- meta[, env_vars, drop = FALSE]
+  
+  # Convert to numeric and remove columns with all NA
+  env_mat <- as.data.frame(lapply(env_mat, as.numeric))
+  rownames(env_mat) <- rownames(meta)
+  env_mat <- env_mat[, colSums(!is.na(env_mat)) > 1, drop = FALSE]
+  
+  # Remove rows with any NA (needed for Mantel)
+  env_mat <- env_mat[complete.cases(env_mat), , drop = FALSE]
+  
+  cat(paste0("  Environmental variables used: ",
+             paste(colnames(env_mat), collapse = ", "), "\n"))
+  
+  return(env_mat)
+}
+
+# ============================================================
+# STEP 8: Run Mantel + Plot function
+# ============================================================
+
+run_mantel_plot <- function(ps, label, out_file) {
+  
+  cat(paste0("\n--- Running linkET Mantel for: ", label, " ---\n"))
+  
+  # Get top 10 Phyla specific to this group (L or LB)
+  top10_names_local <- get_top10_phyla(ps, label)
+  
+  # Build OTU and spec_select
+  spec_data <- build_spec_select(ps, top10_names_local)
+  otu_rel   <- spec_data$otu_rel
+  spec_sel  <- spec_data$spec_select
+  
+  if (length(spec_sel) < 2) {
+    cat("  Not enough Phyla for analysis\n")
+    return(NULL)
+  }
+  
+  # Build env matrix
+  env_mat <- build_env_matrix(ps)
+  
+  if (nrow(env_mat) < 3) {
+    cat("  Not enough samples with complete environmental data\n")
+    return(NULL)
+  }
+  
+  # Align samples between otu and env
+  common_samples <- intersect(rownames(otu_rel), rownames(env_mat))
+  cat(paste0("  Samples used: ", length(common_samples), "\n"))
+  
+  otu_sub <- otu_rel[common_samples, , drop = FALSE]
+  env_sub <- env_mat[common_samples, , drop = FALSE]
+  
+  # Update spec_select indices after subsetting rows
+  # (column indices remain the same)
+  
+  # Run Mantel test
+  mantel <- linkET::mantel_test(
+    spec        = otu_sub,
+    env         = env_sub,
+    spec_select = spec_sel
+  ) %>%
+    mutate(
+      rd = cut(r,
+               breaks = c(-Inf, 0.2, 0.4, Inf),
+               labels = c("< 0.2", "0.2 - 0.4", ">= 0.4")),
+      pd = cut(p,
+               breaks = c(-Inf, 0.01, 0.05, Inf),
+               labels = c("< 0.01", "0.01 - 0.05", ">= 0.05"))
+    )
+  
+  cat("  Mantel results:\n")
+  print(mantel)
+  
+  # Replace Spec names with Phylum names in mantel results
+  spec_name_map <- setNames(
+    top10_names_local[seq_along(spec_sel)],
+    names(spec_sel)
+  )
+  mantel$spec <- spec_name_map[mantel$spec]
+  
+  # Remove non-significant Mantel links (p >= 0.05)
+  mantel_sig <- mantel %>% filter(p < 0.05)
+  cat(paste0("  Significant Mantel links (p < 0.05): ", nrow(mantel_sig), "\n"))
+  
+  # Plot
+  p <- qcorrplot(linkET::correlate(env_sub),
+                 type = "lower", diag = FALSE) +
+    geom_square() +
+    geom_couple(data   = mantel_sig,
+                aes(colour = pd, size = rd),
+                curvature = nice_curvature()) +
+    scale_fill_gradientn(
+      colors = RColorBrewer::brewer.pal(11, "RdBu")
+    ) +
+    scale_size_manual(values = c(0.5, 1.5, 3)) +
+    scale_colour_manual(values = color_pal(3)) +
+    guides(
+      size  = guide_legend(title = "Mantel's r",
+                           override.aes = list(color = "grey35"),
+                           order = 2),
+      color = guide_legend(title = "Mantel's p",
+                           override.aes = list(size = 3),
+                           order = 1),
+      fill  = guide_colorbar(title = "Pearson's r", order = 3)
+    ) +
+    labs(title = paste0("Mantel Test — PETAR ", label)) +
+    theme(
+      plot.title   = element_text(hjust = 0.5, face = "bold", size = 14),
+      legend.text  = element_text(size = 10),
+      legend.title = element_text(size = 11, face = "bold"),
+      axis.text    = element_text(size = 9)
+    )
+  
+  print(p)
+  ggsave(out_file, plot = p,
+         width = 12, height = 10, dpi = 600, bg = "white")
+  cat(paste0("  Saved: ", out_file, "\n"))
+  
+  # Save Mantel results table
+  tsv_out <- gsub(".png", ".tsv", out_file)
+  write.table(mantel, file = tsv_out,
+              quote = FALSE, sep = "\t", row.names = FALSE)
+  cat(paste0("  Saved: ", tsv_out, "\n"))
+  
+  return(p)
+}
+
+# ============================================================
+# STEP 9: Run for L and LB separately
+# ============================================================
+
+p_L  <- run_mantel_plot(ps_L,  "L",  "mantel_linkET_PETAR_L.png")
+p_LB <- run_mantel_plot(ps_LB, "LB", "mantel_linkET_PETAR_LB.png")
+
+# ============================================================
+# STEP 10: Mantel — Depth groups vs Geochemical elements
+# Spec groups = depth intervals, Env = geochemical elements
+# ============================================================
+
+run_mantel_depth <- function(ps, label, out_file) {
+  
+  cat(paste0("\n--- Running linkET Mantel (Depth) for: ", label, " ---\n"))
+  
+  # Build OTU matrix
+  otu_rel <- build_otu_matrix(ps)
+  
+  # Build env matrix (geochemical only)
+  env_mat <- build_env_matrix(ps)
+  
+  if (nrow(env_mat) < 3) {
+    cat("  Not enough samples with complete environmental data\n")
+    return(NULL)
+  }
+  
+  # Align samples
+  common_samples <- intersect(rownames(otu_rel), rownames(env_mat))
+  cat(paste0("  Samples used: ", length(common_samples), "\n"))
+  
+  otu_sub <- otu_rel[common_samples, , drop = FALSE]
+  env_sub <- env_mat[common_samples, , drop = FALSE]
+  
+  # Get Core.depth for each sample
+  meta_df    <- data.frame(sample_data(ps))
+  depth_vals <- meta_df$Core.depth[match(common_samples, rownames(meta_df))]
+  
+  # Get unique depth levels ordered
+  depth_levels <- levels(droplevels(as.factor(depth_vals)))
+  cat(paste0("  Depth levels: ", paste(depth_levels, collapse = ", "), "\n"))
+  
+  # Build spec_select: one group per depth interval
+  spec_select <- list()
+  for (i in seq_along(depth_levels)) {
+    samps_at_depth <- common_samples[depth_vals == depth_levels[i]]
+    if (length(samps_at_depth) > 0) {
+      # Get column indices of ASVs present in these samples
+      asv_present <- which(colSums(otu_sub[samps_at_depth, , drop = FALSE]) > 0)
+      if (length(asv_present) > 0) {
+        spec_select[[paste0("Depth_", depth_levels[i])]] <- asv_present
+      }
+    }
+  }
+  
+  cat(paste0("  Depth groups built: ", length(spec_select), "\n"))
+  
+  if (length(spec_select) < 2) {
+    cat("  Not enough depth groups\n")
+    return(NULL)
+  }
+  
+  # Run Mantel test
+  mantel <- linkET::mantel_test(
+    spec        = otu_sub,
+    env         = env_sub,
+    spec_select = spec_select
+  ) %>%
+    mutate(
+      rd = cut(r,
+               breaks = c(-Inf, 0.2, 0.4, Inf),
+               labels = c("< 0.2", "0.2 - 0.4", ">= 0.4")),
+      pd = cut(p,
+               breaks = c(-Inf, 0.01, 0.05, Inf),
+               labels = c("< 0.01", "0.01 - 0.05", ">= 0.05"))
+    )
+  
+  # Filter non-significant links
+  mantel_sig <- mantel %>% filter(p < 0.05)
+  cat(paste0("  Significant Mantel links (p < 0.05): ", nrow(mantel_sig), "\n"))
+  
+  # Plot
+  p <- qcorrplot(linkET::correlate(env_sub),
+                 type = "lower", diag = FALSE) +
+    geom_square() +
+    geom_couple(data      = mantel_sig,
+                aes(colour = pd, size = rd),
+                curvature = nice_curvature()) +
+    scale_fill_gradientn(
+      colors = RColorBrewer::brewer.pal(11, "RdBu")
+    ) +
+    scale_size_manual(values = c(0.5, 1.5, 3)) +
+    scale_colour_manual(values = color_pal(3)) +
+    guides(
+      size  = guide_legend(title = "Mantel\'s r",
+                           override.aes = list(color = "grey35"),
+                           order = 2),
+      color = guide_legend(title = "Mantel\'s p",
+                           override.aes = list(size = 3),
+                           order = 1),
+      fill  = guide_colorbar(title = "Pearson\'s r", order = 3)
+    ) +
+    labs(title = paste0("Mantel Test (Depth) — PETAR ", label)) +
+    theme(
+      plot.title   = element_text(hjust = 0.5, face = "bold", size = 14),
+      legend.text  = element_text(size = 10),
+      legend.title = element_text(size = 11, face = "bold"),
+      axis.text    = element_text(size = 9)
+    )
+  
+  print(p)
+  ggsave(out_file, plot = p,
+         width = 12, height = 10, dpi = 600, bg = "white")
+  cat(paste0("  Saved: ", out_file, "\n"))
+  
+  tsv_out <- gsub(".png", ".tsv", out_file)
+  write.table(mantel, file = tsv_out,
+              quote = FALSE, sep = "\t", row.names = FALSE)
+  cat(paste0("  Saved: ", tsv_out, "\n"))
+  
+  return(p)
+}
+
+# Run depth Mantel for L and LB
+p_L_depth  <- run_mantel_depth(ps_L,  "L",  "mantel_linkET_depth_L.png")
+p_LB_depth <- run_mantel_depth(ps_LB, "LB", "mantel_linkET_depth_LB.png")
+
+cat("\n========== linkET Mantel Complete ==========\n")
+cat("Output files:\n")
+cat("  mantel_linkET_PETAR_L.png      / .tsv\n")
+cat("  mantel_linkET_PETAR_LB.png     / .tsv\n")
+cat("  mantel_linkET_depth_L.png      / .tsv\n")
+cat("  mantel_linkET_depth_LB.png     / .tsv\n")
+cat("============================================\n")
